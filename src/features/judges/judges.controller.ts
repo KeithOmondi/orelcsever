@@ -11,14 +11,28 @@
 // No business logic. No SQL. No role checks beyond what the middleware
 // already enforced — the service re-verifies authorization anyway.
 //
-// No upload handler: judge portraits are external URLs, not Cloudinary
-// uploads. See the note on `imageUrl` in judges.types.ts.
+// Image handling:
+//   - Routes mount `upload.single('image')` from upload.middleware.ts,
+//     so portraits arrive as `req.file.buffer` on POST/PATCH.
+//   - The controller uploads that buffer to Cloudinary via
+//     `uploadBuffer()` and passes the resulting `ImageAsset | null` to
+//     the service. Bytes never reach the service.
+//   - On PATCH, absence of a file means "leave the existing portrait
+//     alone" — we pass `undefined`, not `null`, to preserve the
+//     three-state semantics the service defines.
+//   - On POST, absence of a file means "no portrait" — we pass `null`.
+//   - With multipart/form-data, non-file fields arrive as strings.
+//     `payload` is sent as a JSON string and parsed here. If the
+//     request is application/json (no image attached), `payload` is
+//     already an object and we use it as-is.
 
 import { Request, Response } from 'express';
 import * as judgesService from './judges.service';
 import { catchAsync } from '../../utils/catchasync';
 import { sendResponse } from '../../utils/Apiresponse';
 import { AppError } from '../../utils/Apperror';
+import { uploadBuffer } from '../../utils/upload';
+import type { ImageAsset } from './judges.types';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -33,6 +47,54 @@ const param = (req: Request, key: string): string => {
     throw new AppError(`${key} must be a single value.`, 400);
   }
   return value;
+};
+
+/**
+ * Extract `payload` from the request body regardless of content type.
+ *
+ *   - application/json: body.payload is an object already.
+ *   - multipart/form-data: body.payload is a JSON string; parse it.
+ *
+ * A malformed JSON string is a client error (400), not a server error.
+ */
+const extractPayload = (req: Request): unknown => {
+  const raw = req.body?.payload;
+
+  if (raw === undefined) {
+    throw new AppError('payload is required.', 400);
+  }
+
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new AppError('payload must be valid JSON.', 400);
+    }
+  }
+
+  return raw;
+};
+
+/**
+ * Upload `req.file` to Cloudinary, if present.
+ *
+ * `folder` is 'judges' — the only sub-folder this feature writes to.
+ * If you later add per-station or per-record folders, make this a
+ * parameter.
+ */
+const uploadPortraitIfPresent = async (
+  req: Request,
+): Promise<ImageAsset | null> => {
+  const file = req.file;
+  if (!file) return null;
+
+  const result = await uploadBuffer(
+    file.buffer,
+    { folder: 'judges' },
+    file.mimetype,
+  );
+
+  return { url: result.url, publicId: result.publicId };
 };
 
 // ─── Public ──────────────────────────────────────────────────────────────────
@@ -108,15 +170,26 @@ export const getJudgeHandler = catchAsync(
  * POST /judges/admin
  * Admin. Creates a new draft judge record.
  *
+ * Content types accepted:
+ *   - multipart/form-data with a `payload` JSON string field and an
+ *     optional `image` file.
+ *   - application/json with a `payload` object (no image).
+ *
  * Body: { payload: JudgeInput }
  */
 export const createJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {
-    const { payload } = req.body;
+    const payload = extractPayload(req) as Parameters<
+      typeof judgesService.createJudge
+    >[2];
+
+    const image = await uploadPortraitIfPresent(req);
+
     const judge = await judgesService.createJudge(
       req.user!.id,
       req.user!.role,
       payload,
+      image,
     );
     sendResponse(res, 201, judge, 'Judge record created.');
   },
@@ -127,16 +200,36 @@ export const createJudgeHandler = catchAsync(
  * Admin. Updates a judge record the caller owns. Only drafts and
  * rejected records can be edited.
  *
+ * Image semantics:
+ *   - No file attached        → leave existing portrait alone.
+ *   - File attached           → replace portrait (old asset deleted by
+ *                               the service after the DB write).
+ *
+ * There is intentionally no "clear the portrait" path via PATCH. If you
+ * need one, add a dedicated endpoint (DELETE .../image) so the intent
+ * is explicit and doesn't overload "no file" with two meanings.
+ *
  * Body: { payload: Partial<JudgeInput> }
  */
 export const updateJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {
     const judgeId = param(req, 'judgeId');
-    const { payload } = req.body;
+    const payload = extractPayload(req) as Parameters<
+      typeof judgesService.updateJudge
+    >[2];
+
+    // Distinguish "no file" (undefined → leave alone) from "clear"
+    // (null). Only upload if a file is present; otherwise pass
+    // `undefined`.
+    const image = req.file
+      ? await uploadPortraitIfPresent(req)
+      : undefined;
+
     const judge = await judgesService.updateJudge(
       req.user!.id,
       judgeId,
       payload,
+      image,
     );
     sendResponse(res, 200, judge, 'Judge record updated.');
   },
@@ -157,6 +250,9 @@ export const submitJudgeHandler = catchAsync(
 /**
  * DELETE /judges/admin/:judgeId
  * Admin. Deletes the caller's own draft or rejected judge record.
+ *
+ * The service deletes the Cloudinary portrait after the DB row is
+ * removed, fire-and-forget.
  */
 export const deleteJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {

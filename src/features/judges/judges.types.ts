@@ -16,16 +16,18 @@
 //     Only `published` judges are visible on the public site.
 //
 // Differences from the other features:
-//   - No file upload. Judge portraits are optional and referenced by
-//     URL, not uploaded through the admin panel. If you want the same
-//     Cloudinary upload flow as News/Events, tell me — the schema and
-//     service change but the pattern is already established.
+//   - Portraits ARE uploaded through the admin panel via Cloudinary.
+//     The row stores both `imagePublicId` (for delete/replace) and
+//     `imageUrl` (the derived secure URL served to the client).
+//     Upload mechanics live in utils/upload.ts; the service accepts
+//     the already-uploaded result, not raw bytes.
 //   - Structured list fields. `education` and `specializations` are
-//     arrays of strings, stored as JSONB. They're rendered as a list
-//     and a set of chips in the detail modal.
-//   - Region is a governed value (used for the filter dropdown in the
-//     mock). Station is free text — station names vary and don't need
-//     to be pinned. Confirm if you'd rather station also be an enum.
+//     arrays, stored as JSONB. They're rendered as a list and a set
+//     of chips in the detail modal.
+//   - Region is a governed value (used for the filter dropdown in
+//     the mock). Station is free text — station names vary and don't
+//     need to be pinned. Confirm if you'd rather station also be an
+//     enum.
 
 import { Role } from '../../types/roles';
 
@@ -65,16 +67,27 @@ export type JudgeRegion = (typeof JUDGE_REGIONS)[number];
  * plain string so the display can render the degree and the institution
  * separately, and so a future "filter by university" feature has
  * something to query.
- *
- * For now, the mock stores these as pre-formatted strings
- * ("Master of Laws (LL.M) - University of Nairobi"). If you'd rather
- * keep the string form, change `education` to `string[]` and simplify
- * the validator — it's a small change.
  */
 export interface EducationEntry {
   degree: string;
   institution: string;
   year?: string;
+}
+
+// ─── Cloudinary image reference ──────────────────────────────────────────────
+
+/**
+ * A stored image asset. Both fields are persisted together:
+ *   - `publicId` is required to later delete or replace the asset.
+ *   - `url` is the secure (https) delivery URL, cached on the row so
+ *     list endpoints don't have to build it on every read.
+ *
+ * Empty image is represented as `null`, not as an object with empty
+ * strings — the absence of an image is a state, not a value.
+ */
+export interface ImageAsset {
+  publicId: string;
+  url: string;
 }
 
 // ─── Live content — normalized shape ─────────────────────────────────────────
@@ -110,15 +123,13 @@ export interface Judge {
   specializations: string[];
 
   /**
-   * Optional portrait URL. Empty string when no portrait is available —
+   * Optional portrait. `null` when no portrait has been uploaded —
    * the public card falls back to a placeholder.
    *
-   * Not stored as a Cloudinary public id because portraits are not
-   * uploaded through this feature. If they become uploads, add
-   * `imagePublicId` alongside and mirror the News/Events cleanup
-   * pattern.
+   * Both fields are written together by the service whenever a new
+   * file is uploaded through the admin panel.
    */
-  imageUrl: string;
+  image: ImageAsset | null;
 
   status: JudgeStatus;
 
@@ -150,6 +161,11 @@ export type PublicJudge = Omit<
 /**
  * Editable fields of a judge record. Excludes id, status, timestamps,
  * and audit fields — set by the service, not the client.
+ *
+ * The image is NOT a URL string here. The client uploads a file; the
+ * controller uploads it to Cloudinary and passes the resulting
+ * `ImageAsset` (or `null` to clear it). This keeps the service
+ * upload-agnostic and testable without Cloudinary.
  */
 export interface JudgeInput {
   name: string;
@@ -160,7 +176,7 @@ export interface JudgeInput {
   bio: string;
   education: EducationEntry[];
   specializations: string[];
-  imageUrl: string;
+  image: ImageAsset | null;
 }
 
 // ─── Results — what the controller returns ───────────────────────────────────
@@ -182,7 +198,7 @@ export interface JudgeSummary {
   bio: string;
   education: EducationEntry[];
   specializations: string[];
-  imageUrl: string;
+  image: ImageAsset | null;
   status: JudgeStatus;
   publishedAt: Date | null;
   createdAt: Date;

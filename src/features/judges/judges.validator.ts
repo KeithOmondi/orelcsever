@@ -9,6 +9,13 @@
 // shape of a judge record. Status, timestamps, and audit fields are
 // never accepted from the client — they're set by the service.
 //
+// The image is NOT part of `judgeInputSchema`. Portraits are uploaded
+// as multipart files; multer hands the bytes to the controller, which
+// uploads to Cloudinary via utils/upload.ts and passes the resulting
+// `ImageAsset | null` straight to the service. Keeping the image out
+// of the JSON schema means the upload path and the edit path don't
+// have to agree on a URL string, and the service stays upload-agnostic.
+//
 // `judgeIdParamSchema` is wrapped as `{ params: { judgeId } }` so it
 // works with `validate.middleware.ts`, which only reads from
 // `req.params` when the schema has a `.shape.params` branch.
@@ -38,23 +45,6 @@ const optionalTrimmedString = (max = 500) =>
     .optional()
     .nullable()
     .transform((v) => (v === '' ? null : v ?? null));
-
-// ─── Image URL ───────────────────────────────────────────────────────────────
-//
-// Same rationale as the other features: the field is a URL, not a
-// Cloudinary upload, and it's allowed to be empty (a judge record can
-// exist without a portrait — the public card falls back to a
-// placeholder).
-
-const imageUrl = () =>
-  z
-    .string()
-    .trim()
-    .max(500, { error: 'Image URL must be 500 characters or fewer.' })
-    .refine(
-      (v) => v === '' || /^https?:\/\//i.test(v),
-      { error: 'Image URL must be a valid URL.' },
-    );
 
 // ─── Appointed year ──────────────────────────────────────────────────────────
 //
@@ -117,6 +107,13 @@ const specializationSchema = z
   .max(100, { error: 'Specialization must be 100 characters or fewer.' });
 
 // ─── Judge input ─────────────────────────────────────────────────────────────
+//
+// Everything except the image. The image arrives as a multipart file
+// and is handled by the controller before the service is called.
+//
+// Region is a governed enum; station is free text. Appointed year is a
+// four-digit string, not a number, to preserve leading zeros and avoid
+// the "2012.0" trap.
 
 export const judgeInputSchema = z.object({
   name:  trimmedString('Name', 200),
@@ -141,14 +138,17 @@ export const judgeInputSchema = z.object({
     .array(specializationSchema)
     .max(10, { error: 'A judge can have at most 10 specializations.' })
     .default([]),
-
-  imageUrl: imageUrl(),
 });
 
 // ─── Action inputs ──────────────────────────────────────────────────────────
 
 // POST /judges/admin
 // Admin. Creates a new judge record. Always lands as a draft.
+//
+// Multipart body — text fields arrive as strings under `payload.*` and
+// the optional image arrives as a file. The controller parses the
+// multipart payload into the shape below; this schema validates the
+// text half only.
 export const createJudgeSchema = z.object({
   payload: judgeInputSchema,
 });
@@ -161,6 +161,11 @@ export const createJudgeSchema = z.object({
 // nested arrays (`education`, `specializations`) become optional too,
 // which is the behavior we want: a PATCH that only updates `bio` leaves
 // the existing arrays alone.
+//
+// The image is replaced by uploading a new file alongside the PATCH.
+// Absence of a file means "keep the existing image"; a file means
+// "replace it"; a separate DELETE endpoint (not implemented) would be
+// the way to clear it without replacement.
 export const updateJudgeSchema = z.object({
   payload: judgeInputSchema.partial(),
 });
@@ -249,6 +254,10 @@ export const listJudgesQuerySchema = z.object({
 // These should be assignable to the corresponding entries in
 // judges.types.ts. If the compiler complains, the validator and the
 // domain types have drifted.
+//
+// Note: `JudgeInputPayload` no longer contains an image. The service's
+// `createJudge` / `updateJudge` take a second argument for the uploaded
+// `ImageAsset | null` — see judges.service.ts.
 
 export type JudgeInputPayload       = z.infer<typeof judgeInputSchema>;
 export type CreateJudgeInputSchema  = z.infer<typeof createJudgeSchema>;

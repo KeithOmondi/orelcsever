@@ -12,11 +12,24 @@
 // Nothing here talks HTTP. Controllers call these functions and shape
 // the response. All row → domain mapping lives here.
 //
-// No file lifecycle for this feature — portraits are external URLs, not
-// Cloudinary uploads. See the note on `imageUrl` in judges.types.ts.
+// Image lifecycle:
+//   - Portraits are uploaded to Cloudinary by the *controller* (multer
+//     → utils/upload.ts → uploadBuffer). The service receives the
+//     resulting `ImageAsset | null` and never touches bytes.
+//   - On create: the asset is written to the row.
+//   - On update: the controller uploads the new asset first, then calls
+//     this service. This service writes the row and, on success, deletes
+//     the *old* asset. Order matters: upload → DB write → delete old.
+//     Deleting the old asset before the DB write would lose the old
+//     portrait if the write fails.
+//   - On delete: the row is removed first, then the asset is deleted
+//     fire-and-forget. A Cloudinary failure here must not roll back the
+//     DB delete — the row is gone either way, and a stray asset is a
+//     cleanup issue, not a correctness issue.
 
 import { query } from '../../config/db';
 import { AppError } from '../../utils/Apperror';
+import { deleteAsset } from '../../utils/upload';
 import type { Role } from '../../types/roles';
 import type {
   Judge,
@@ -24,6 +37,7 @@ import type {
   PublicJudge,
   PublicJudgeSummary,
   EducationEntry,
+  ImageAsset,
 } from './judges.types';
 import type {
   JudgeInputPayload,
@@ -41,6 +55,11 @@ import type {
 // already parsed as arrays, so no decoding is needed — but we assert
 // the shape so a malformed row fails loudly rather than rendering an
 // empty modal.
+//
+// `image_url` + `image_public_id` are two columns that together form
+// one domain field (`image`). Both must be present to count as an
+// image; a row with only one of them is a data bug, so we treat it as
+// "no image" and log loudly rather than half-render.
 
 const assertEducationShape = (value: unknown): EducationEntry[] => {
   if (!Array.isArray(value)) return [];
@@ -59,6 +78,28 @@ const assertStringArray = (value: unknown): string[] => {
   return value.filter((s): s is string => typeof s === 'string');
 };
 
+/**
+ * Rebuild the `ImageAsset | null` from the two columns that store it.
+ * A partial row (URL without publicId, or vice versa) is a bug: log
+ * and treat as no image so the UI still renders.
+ */
+const mapImage = (
+  url: string | null | undefined,
+  publicId: string | null | undefined,
+): ImageAsset | null => {
+  if (url && publicId) {
+    return { url, publicId };
+  }
+  if (url || publicId) {
+    console.warn(
+      '[judges.service] Row has a partial image: ' +
+        `url=${url ?? 'null'} publicId=${publicId ?? 'null'}. ` +
+        'Treating as no image.',
+    );
+  }
+  return null;
+};
+
 const mapJudgeRow = (row: Record<string, any>): Judge => ({
   id:              row.id,
   name:            row.name,
@@ -69,7 +110,7 @@ const mapJudgeRow = (row: Record<string, any>): Judge => ({
   bio:             row.bio,
   education:       assertEducationShape(row.education),
   specializations: assertStringArray(row.specializations),
-  imageUrl:        row.image_url,
+  image:           mapImage(row.image_url, row.image_public_id),
   status:          row.status,
   publishedAt:     row.published_at,
   createdBy:       row.created_by,
@@ -91,7 +132,7 @@ const mapJudgeSummary = (row: Record<string, any>): JudgeSummary => ({
   bio:             row.bio,
   education:       assertEducationShape(row.education),
   specializations: assertStringArray(row.specializations),
-  imageUrl:        row.image_url,
+  image:           mapImage(row.image_url, row.image_public_id),
   status:          row.status,
   publishedAt:     row.published_at,
   createdAt:       row.created_at,
@@ -119,6 +160,17 @@ const toPublicSummary = (summary: JudgeSummary): PublicJudgeSummary => {
   const { status, ...rest } = summary;
   return rest;
 };
+
+/**
+ * Column list used by every read that returns a Summary. Kept as a
+ * constant so the SELECT list and the mapper can't drift — if you add
+ * a column to `mapJudgeSummary`, add it here too.
+ */
+const SUMMARY_COLUMNS = `
+  id, name, title, station, region, appointed_year, bio,
+  education, specializations, image_url, image_public_id,
+  status, published_at, created_at, updated_at
+`;
 
 // ─── Transaction helper ──────────────────────────────────────────────────────
 //
@@ -198,9 +250,7 @@ export const listPublishedJudges = async (
   const [countRes, pageRes] = await Promise.all([
     query(`SELECT COUNT(*)::int AS total FROM judges ${where}`, params),
     query(
-      `SELECT id, name, title, station, region, appointed_year, bio,
-              education, specializations, image_url, status,
-              published_at, created_at, updated_at
+      `SELECT ${SUMMARY_COLUMNS}
          FROM judges
          ${where}
          ORDER BY name ASC
@@ -238,9 +288,7 @@ export const getPublishedJudgeById = async (id: string): Promise<PublicJudge> =>
  */
 export const listAllJudges = async (): Promise<JudgeSummary[]> => {
   const result = await query(
-    `SELECT id, name, title, station, region, appointed_year, bio,
-            education, specializations, image_url, status,
-            published_at, created_at, updated_at
+    `SELECT ${SUMMARY_COLUMNS}
        FROM judges
        ORDER BY name ASC`,
   );
@@ -252,9 +300,7 @@ export const listAllJudges = async (): Promise<JudgeSummary[]> => {
  */
 export const listPendingJudges = async (): Promise<JudgeSummary[]> => {
   const result = await query(
-    `SELECT id, name, title, station, region, appointed_year, bio,
-            education, specializations, image_url, status,
-            published_at, created_at, updated_at
+    `SELECT ${SUMMARY_COLUMNS}
        FROM judges
        WHERE status = 'pending'
        ORDER BY created_at ASC`,
@@ -279,20 +325,28 @@ export const getJudgeById = async (id: string): Promise<Judge> => {
 /**
  * Create a new draft judge record. The caller's id and role are stamped
  * on the row for the audit trail.
+ *
+ * `image` is the result of `uploadBuffer()` in the controller, or `null`
+ * if no portrait was uploaded. It is stored as two columns
+ * (`image_url` + `image_public_id`) so a later replace can delete the
+ * old asset by public id.
  */
 export const createJudge = async (
   userId: string,
   role: Role,
   input: JudgeInputPayload,
+  image: ImageAsset | null,
 ): Promise<Judge> => {
   const result = await query(
     `INSERT INTO judges
        (name, title, station, region, appointed_year, bio,
-        education, specializations, image_url,
+        education, specializations,
+        image_url, image_public_id,
         status, created_by, created_by_role)
      VALUES ($1, $2, $3, $4, $5, $6,
-             $7::jsonb, $8::jsonb, $9,
-             'draft', $10, $11)
+             $7::jsonb, $8::jsonb,
+             $9, $10,
+             'draft', $11, $12)
      RETURNING *`,
     [
       input.name,
@@ -303,7 +357,8 @@ export const createJudge = async (
       input.bio,
       JSON.stringify(input.education ?? []),
       JSON.stringify(input.specializations ?? []),
-      input.imageUrl,
+      image?.url ?? null,
+      image?.publicId ?? null,
       userId,
       role,
     ],
@@ -319,6 +374,19 @@ export const createJudge = async (
  *
  * Partial update: only fields present in `input` are changed.
  *
+ * Image semantics:
+ *   - `image === undefined` → leave the existing portrait alone.
+ *   - `image === null`      → clear the portrait (row set to NULLs,
+ *                             old asset deleted from Cloudinary).
+ *   - `image` is an asset   → replace the portrait (row overwritten,
+ *                             old asset deleted from Cloudinary).
+ *
+ * The controller uploads any new asset before calling this. This
+ * function only performs the DB write and the *old* asset cleanup.
+ * Order is: upload (controller) → DB write → delete old (here). If the
+ * DB write throws, the new asset is orphaned in Cloudinary but the old
+ * one is intact — recoverable, and never a data-loss scenario.
+ *
  * The two JSONB arrays are serialized with `JSON.stringify` and cast
  * with `::jsonb`. Passing a raw JS array to pg works too, but the
  * explicit cast guarantees the parameter is treated as JSONB and not
@@ -329,6 +397,7 @@ export const updateJudge = async (
   userId: string,
   judgeId: string,
   input: UpdateJudgeInputSchema['payload'],
+  image: ImageAsset | null | undefined,
 ): Promise<Judge> => {
   const existing = await getJudgeById(judgeId);
 
@@ -364,9 +433,18 @@ export const updateJudge = async (
   if (input.specializations !== undefined) {
     set('specializations', JSON.stringify(input.specializations), 'jsonb');
   }
-  if (input.imageUrl      !== undefined) set('image_url',      input.imageUrl);
+
+  // Image: three states. `undefined` means "not provided" — leave
+  // alone. `null` means "clear". An asset means "replace".
+  const hasImageChange = image !== undefined;
+  if (hasImageChange) {
+    set('image_url',       image?.url ?? null);
+    set('image_public_id', image?.publicId ?? null);
+  }
 
   if (fields.length === 0) {
+    // Nothing to write. Return the existing record without touching
+    // Cloudinary — the old asset is still correct.
     return existing;
   }
 
@@ -381,7 +459,22 @@ export const updateJudge = async (
     params,
   );
 
-  return mapJudgeRow(result.rows[0]);
+  const updated = mapJudgeRow(result.rows[0]);
+
+  // Delete the old asset *after* the DB write commits. Fire-and-forget
+  // — a Cloudinary failure here is a cleanup issue, not a correctness
+  // issue, and must not turn a successful update into an error.
+  if (hasImageChange && existing.image?.publicId) {
+    void deleteAsset(existing.image.publicId).catch((err) => {
+      console.warn(
+        `[judges.service] Failed to delete old portrait ` +
+          `(publicId=${existing.image?.publicId}) after update: `,
+        err,
+      );
+    });
+  }
+
+  return updated;
 };
 
 /**
@@ -419,7 +512,11 @@ export const submitJudge = async (
  * it's still a draft or rejected. Pending and published records are
  * immutable from the admin's side.
  *
- * No Cloudinary cleanup — portraits are external URLs, not uploads.
+ * Cloudinary cleanup is fire-and-forget after the DB delete. If it
+ * fails, the row is still gone (correct) and the asset is orphaned
+ * (acceptable). Reversing the order — delete asset first, then row —
+ * would lose the portrait if the DB delete then failed, which is
+ * worse.
  */
 export const deleteJudge = async (
   userId: string,
@@ -438,6 +535,16 @@ export const deleteJudge = async (
   }
 
   await query('DELETE FROM judges WHERE id = $1', [judgeId]);
+
+  if (existing.image?.publicId) {
+    void deleteAsset(existing.image.publicId).catch((err) => {
+      console.warn(
+        `[judges.service] Failed to delete portrait ` +
+          `(publicId=${existing.image?.publicId}) after delete: `,
+        err,
+      );
+    });
+  }
 };
 
 // ─── Super admin review ──────────────────────────────────────────────────────
