@@ -15,12 +15,15 @@
 //   - Routes mount `upload.single('image')` from upload.middleware.ts,
 //     so portraits arrive as `req.file.buffer` on POST/PATCH.
 //   - The controller uploads that buffer to Cloudinary via
-//     `uploadBuffer()` and passes the resulting `ImageAsset | null` to
-//     the service. Bytes never reach the service.
-//   - On PATCH, absence of a file means "leave the existing portrait
-//     alone" — we pass `undefined`, not `null`, to preserve the
-//     three-state semantics the service defines.
-//   - On POST, absence of a file means "no portrait" — we pass `null`.
+//     `uploadBuffer()` and passes the resulting `ImageAsset` to the
+//     service. Bytes never reach the service.
+//   - "No file" is not the same as "no image". The service distinguishes
+//     three states on update:
+//         undefined → leave the existing portrait alone
+//         null      → clear the portrait
+//         asset     → replace the portrait
+//     The controller maps `req.file` presence to the right one. See
+//     `resolveImageArg` below for the exact rule.
 //   - With multipart/form-data, non-file fields arrive as strings.
 //     `payload` is sent as a JSON string and parsed here. If the
 //     request is application/json (no image attached), `payload` is
@@ -33,6 +36,7 @@ import { sendResponse } from '../../utils/Apiresponse';
 import { AppError } from '../../utils/Apperror';
 import { uploadBuffer } from '../../utils/upload';
 import type { ImageAsset } from './judges.types';
+import type { JudgeInputPayload, UpdateJudgeInputSchema } from './judges.validator';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -56,6 +60,12 @@ const param = (req: Request, key: string): string => {
  *   - multipart/form-data: body.payload is a JSON string; parse it.
  *
  * A malformed JSON string is a client error (400), not a server error.
+ *
+ * Note: this returns `unknown`. The caller asserts the shape and the
+ * validator has already run on the parsed object (the middleware
+ * inspects `req.body.payload` after this same parse, via the schema's
+ * `payload` branch). The cast at the callsite is a narrowing hint, not
+ * a runtime guarantee — the guarantee comes from the validator.
  */
 const extractPayload = (req: Request): unknown => {
   const raw = req.body?.payload;
@@ -76,17 +86,34 @@ const extractPayload = (req: Request): unknown => {
 };
 
 /**
- * Upload `req.file` to Cloudinary, if present.
+ * Resolve the `image` argument for the service from the request.
  *
- * `folder` is 'judges' — the only sub-folder this feature writes to.
- * If you later add per-station or per-record folders, make this a
- * parameter.
+ * The service defines three states on update:
+ *   undefined → leave existing portrait alone
+ *   null      → clear existing portrait
+ *   ImageAsset → replace existing portrait
+ *
+ * On create, only two states are meaningful:
+ *   null       → no portrait
+ *   ImageAsset → portrait
+ *
+ * Both are covered by the same function: "no file" maps to `undefined`
+ * on update and to `null` on create. The caller picks which by passing
+ * `undefinedForNoFile`.
+ *
+ * If a file is present, it is uploaded to Cloudinary and the result is
+ * returned. If not, the sentinel is returned without touching the
+ * network.
  */
-const uploadPortraitIfPresent = async (
+const resolveImageArg = async (
   req: Request,
-): Promise<ImageAsset | null> => {
+  undefinedForNoFile: boolean,
+): Promise<ImageAsset | null | undefined> => {
   const file = req.file;
-  if (!file) return null;
+
+  if (!file) {
+    return undefinedForNoFile ? undefined : null;
+  }
 
   const result = await uploadBuffer(
     file.buffer,
@@ -179,17 +206,17 @@ export const getJudgeHandler = catchAsync(
  */
 export const createJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {
-    const payload = extractPayload(req) as Parameters<
-      typeof judgesService.createJudge
-    >[2];
+    const payload = extractPayload(req) as JudgeInputPayload;
 
-    const image = await uploadPortraitIfPresent(req);
+    // On create, "no file" means "no portrait" (null), not "leave
+    // alone" (undefined). There's nothing to leave alone.
+    const image = await resolveImageArg(req, /* undefinedForNoFile */ false);
 
     const judge = await judgesService.createJudge(
       req.user!.id,
       req.user!.role,
       payload,
-      image,
+      image as ImageAsset | null,
     );
     sendResponse(res, 201, judge, 'Judge record created.');
   },
@@ -201,29 +228,28 @@ export const createJudgeHandler = catchAsync(
  * rejected records can be edited.
  *
  * Image semantics:
- *   - No file attached        → leave existing portrait alone.
- *   - File attached           → replace portrait (old asset deleted by
- *                               the service after the DB write).
+ *   - No file attached        → leave existing portrait alone
+ *                               (service receives `undefined`).
+ *   - File attached           → replace portrait. The service deletes
+ *                               the previous Cloudinary asset after
+ *                               the DB write commits.
  *
- * There is intentionally no "clear the portrait" path via PATCH. If you
- * need one, add a dedicated endpoint (DELETE .../image) so the intent
- * is explicit and doesn't overload "no file" with two meanings.
+ * There is intentionally no "clear the portrait" path via PATCH. When
+ * you want one, add `DELETE /judges/admin/:judgeId/image` with a
+ * dedicated handler that calls the service with `image: null` — the
+ * service already supports it; only the route is missing.
  *
  * Body: { payload: Partial<JudgeInput> }
  */
 export const updateJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {
     const judgeId = param(req, 'judgeId');
-    const payload = extractPayload(req) as Parameters<
-      typeof judgesService.updateJudge
-    >[2];
+    const payload = extractPayload(req) as UpdateJudgeInputSchema['payload'];
 
-    // Distinguish "no file" (undefined → leave alone) from "clear"
-    // (null). Only upload if a file is present; otherwise pass
-    // `undefined`.
-    const image = req.file
-      ? await uploadPortraitIfPresent(req)
-      : undefined;
+    // On update, "no file" means "leave alone" (undefined), not
+    // "clear" (null). This is the whole reason the helper takes a
+    // flag — the two routes want opposite defaults.
+    const image = await resolveImageArg(req, /* undefinedForNoFile */ true);
 
     const judge = await judgesService.updateJudge(
       req.user!.id,

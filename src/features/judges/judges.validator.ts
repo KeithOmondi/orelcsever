@@ -11,7 +11,7 @@
 //
 // The image is NOT part of `judgeInputSchema`. Portraits are uploaded
 // as multipart files; multer hands the bytes to the controller, which
-// uploads to Cloudinary via utils/upload.ts and passes the resulting
+// uploads to Cloudinary via `utils/upload.ts` and passes the resulting
 // `ImageAsset | null` straight to the service. Keeping the image out
 // of the JSON schema means the upload path and the edit path don't
 // have to agree on a URL string, and the service stays upload-agnostic.
@@ -19,6 +19,16 @@
 // `judgeIdParamSchema` is wrapped as `{ params: { judgeId } }` so it
 // works with `validate.middleware.ts`, which only reads from
 // `req.params` when the schema has a `.shape.params` branch.
+//
+// Multipart contract:
+//   - `POST /judges/admin` and `PATCH /judges/admin/:judgeId` accept
+//     `multipart/form-data`. The text half travels as a single field
+//     named `payload`, containing a JSON-encoded object. The
+//     controller's `extractPayload` helper JSON.parses it before this
+//     validator runs.
+//   - `createJudgeSchema` / `updateJudgeSchema` therefore describe the
+//     shape of `req.body.payload` after parsing, not the raw form.
+//     The middleware unwraps them accordingly.
 
 import { z } from 'zod';
 import { JUDGE_REGIONS } from './judges.types';
@@ -76,7 +86,9 @@ const appointedYear = () =>
 // separately, and a future "find judges who studied at X" feature has
 // something to query.
 //
-// `year` is optional — some entries in the mock omit it.
+// `year` is optional — some entries in the mock omit it. The `.or(z.literal(''))`
+// branch lets an empty string from a form field arrive without failing;
+// it's normalized to `undefined` by the transform.
 
 const educationEntrySchema = z.object({
   degree: trimmedString('Degree', 200),
@@ -114,6 +126,13 @@ const specializationSchema = z
 // Region is a governed enum; station is free text. Appointed year is a
 // four-digit string, not a number, to preserve leading zeros and avoid
 // the "2012.0" trap.
+//
+// `education` requires at least one entry. Unlike `specializations`,
+// which can legitimately be empty for a judge with no declared focus
+// areas, an empty education list makes the public modal render "No
+// qualifications recorded", which reads as incomplete data rather than
+// an honest absence. The floor is editorial policy, not a data
+// constraint.
 
 export const judgeInputSchema = z.object({
   name:  trimmedString('Name', 200),
@@ -145,10 +164,9 @@ export const judgeInputSchema = z.object({
 // POST /judges/admin
 // Admin. Creates a new judge record. Always lands as a draft.
 //
-// Multipart body — text fields arrive as strings under `payload.*` and
-// the optional image arrives as a file. The controller parses the
-// multipart payload into the shape below; this schema validates the
-// text half only.
+// Multipart body. The text half travels as `payload`, a JSON string
+// that the controller JSON.parses before validation. The optional image
+// travels as a file and never touches this schema.
 export const createJudgeSchema = z.object({
   payload: judgeInputSchema,
 });
@@ -162,17 +180,27 @@ export const createJudgeSchema = z.object({
 // which is the behavior we want: a PATCH that only updates `bio` leaves
 // the existing arrays alone.
 //
-// The image is replaced by uploading a new file alongside the PATCH.
-// Absence of a file means "keep the existing image"; a file means
-// "replace it"; a separate DELETE endpoint (not implemented) would be
-// the way to clear it without replacement.
+// Image semantics on update are decided by the controller, not this
+// schema, because the image is a file:
+//   - No file attached   → leave the existing portrait alone.
+//   - File attached      → replace the portrait. The service deletes
+//                          the previous Cloudinary asset after the DB
+//                          write commits.
+//   - Clear without replacement → not expressible via PATCH. The
+//     service supports it (`image: null`), but no route exposes it.
+//     When you want it, add `DELETE /judges/admin/:judgeId/image`.
 export const updateJudgeSchema = z.object({
   payload: judgeInputSchema.partial(),
 });
 
 // POST /judges/admin/:judgeId/submit
 // Admin. Moves a judge record from draft → pending.
-export const submitJudgeSchema = z.object({}).optional();
+//
+// No body. Declared as a real `ZodObject` (empty) rather than
+// `z.object({}).optional()` so `validate.middleware.ts` recognizes it
+// as a schema it owns and doesn't fall back to its generic body-
+// validation branch — which logs a second time for no reason.
+export const submitJudgeSchema = z.object({});
 
 // POST /judges/admin/:judgeId/approve
 // Super admin. Moves pending → published.
@@ -255,7 +283,7 @@ export const listJudgesQuerySchema = z.object({
 // judges.types.ts. If the compiler complains, the validator and the
 // domain types have drifted.
 //
-// Note: `JudgeInputPayload` no longer contains an image. The service's
+// Note: `JudgeInputPayload` contains no image. The service's
 // `createJudge` / `updateJudge` take a second argument for the uploaded
 // `ImageAsset | null` — see judges.service.ts.
 

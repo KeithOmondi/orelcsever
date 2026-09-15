@@ -26,6 +26,15 @@
 //     fire-and-forget. A Cloudinary failure here must not roll back the
 //     DB delete — the row is gone either way, and a stray asset is a
 //     cleanup issue, not a correctness issue.
+//
+// Row → domain shape:
+//   `image_url` and `image_public_id` are two columns that together
+//   form one domain field (`image`). The database enforces the pairing
+//   via `chk_judges_image_pairing`: either both are NULL, or both are
+//   non-NULL. A partial row is therefore impossible to store, and the
+//   mapper throws if it ever sees one — that means the constraint was
+//   bypassed, which is a bug worth failing loudly on rather than
+//   silently rendering a placeholder.
 
 import { query } from '../../config/db';
 import { AppError } from '../../utils/Apperror';
@@ -55,11 +64,6 @@ import type {
 // already parsed as arrays, so no decoding is needed — but we assert
 // the shape so a malformed row fails loudly rather than rendering an
 // empty modal.
-//
-// `image_url` + `image_public_id` are two columns that together form
-// one domain field (`image`). Both must be present to count as an
-// image; a row with only one of them is a data bug, so we treat it as
-// "no image" and log loudly rather than half-render.
 
 const assertEducationShape = (value: unknown): EducationEntry[] => {
   if (!Array.isArray(value)) return [];
@@ -80,24 +84,31 @@ const assertStringArray = (value: unknown): string[] => {
 
 /**
  * Rebuild the `ImageAsset | null` from the two columns that store it.
- * A partial row (URL without publicId, or vice versa) is a bug: log
- * and treat as no image so the UI still renders.
+ *
+ * The database enforces `(image_url IS NULL) = (image_public_id IS NULL)`
+ * via `chk_judges_image_pairing`. A partial row is impossible to insert
+ * or update through normal channels. If we ever see one anyway, something
+ * bypassed the constraint — a manual edit, a dropped constraint, a
+ * migration gone sideways. Throw rather than degrade: a silent
+ * placeholder hides the problem, a 500 gets it fixed.
  */
 const mapImage = (
   url: string | null | undefined,
   publicId: string | null | undefined,
 ): ImageAsset | null => {
-  if (url && publicId) {
-    return { url, publicId };
-  }
-  if (url || publicId) {
-    console.warn(
-      '[judges.service] Row has a partial image: ' +
-        `url=${url ?? 'null'} publicId=${publicId ?? 'null'}. ` +
-        'Treating as no image.',
-    );
-  }
-  return null;
+  // Both NULL: no portrait. Legitimate and common.
+  if (!url && !publicId) return null;
+
+  // Both set: a complete Cloudinary asset.
+  if (url && publicId) return { url, publicId };
+
+  // Exactly one set: the state the CHECK constraint forbids.
+  throw new Error(
+    `[judges.service] Impossible row state: ` +
+      `image_url=${url === null ? 'null' : typeof url} ` +
+      `image_public_id=${publicId === null ? 'null' : typeof publicId}. ` +
+      `The chk_judges_image_pairing constraint has been bypassed.`,
+  );
 };
 
 const mapJudgeRow = (row: Record<string, any>): Judge => ({
@@ -165,12 +176,27 @@ const toPublicSummary = (summary: JudgeSummary): PublicJudgeSummary => {
  * Column list used by every read that returns a Summary. Kept as a
  * constant so the SELECT list and the mapper can't drift — if you add
  * a column to `mapJudgeSummary`, add it here too.
+ *
+ * The string is joined without a trailing newline so the interpolated
+ * SQL reads cleanly in logs and EXPLAIN output.
  */
-const SUMMARY_COLUMNS = `
-  id, name, title, station, region, appointed_year, bio,
-  education, specializations, image_url, image_public_id,
-  status, published_at, created_at, updated_at
-`;
+const SUMMARY_COLUMNS = [
+  'id',
+  'name',
+  'title',
+  'station',
+  'region',
+  'appointed_year',
+  'bio',
+  'education',
+  'specializations',
+  'image_url',
+  'image_public_id',
+  'status',
+  'published_at',
+  'created_at',
+  'updated_at',
+].join(', ');
 
 // ─── Transaction helper ──────────────────────────────────────────────────────
 //
@@ -436,6 +462,9 @@ export const updateJudge = async (
 
   // Image: three states. `undefined` means "not provided" — leave
   // alone. `null` means "clear". An asset means "replace".
+  //
+  // Both columns are set together so the CHECK constraint
+  // (chk_judges_image_pairing) is satisfied at every intermediate step.
   const hasImageChange = image !== undefined;
   if (hasImageChange) {
     set('image_url',       image?.url ?? null);
@@ -464,11 +493,18 @@ export const updateJudge = async (
   // Delete the old asset *after* the DB write commits. Fire-and-forget
   // — a Cloudinary failure here is a cleanup issue, not a correctness
   // issue, and must not turn a successful update into an error.
-  if (hasImageChange && existing.image?.publicId) {
-    void deleteAsset(existing.image.publicId).catch((err) => {
+  //
+  // The `!== updated.image?.publicId` guard skips the delete when the
+  // new asset happens to have the same public id (e.g. a same-file
+  // re-upload with an overwrite). Without the guard we'd delete the
+  // asset we just wrote.
+  const oldPublicId = existing.image?.publicId;
+  const newPublicId = updated.image?.publicId;
+  if (hasImageChange && oldPublicId && oldPublicId !== newPublicId) {
+    void deleteAsset(oldPublicId).catch((err) => {
       console.warn(
         `[judges.service] Failed to delete old portrait ` +
-          `(publicId=${existing.image?.publicId}) after update: `,
+          `(publicId=${oldPublicId}) after update: `,
         err,
       );
     });
@@ -536,11 +572,12 @@ export const deleteJudge = async (
 
   await query('DELETE FROM judges WHERE id = $1', [judgeId]);
 
-  if (existing.image?.publicId) {
-    void deleteAsset(existing.image.publicId).catch((err) => {
+  const publicId = existing.image?.publicId;
+  if (publicId) {
+    void deleteAsset(publicId).catch((err) => {
       console.warn(
         `[judges.service] Failed to delete portrait ` +
-          `(publicId=${existing.image?.publicId}) after delete: `,
+          `(publicId=${publicId}) after delete: `,
         err,
       );
     });

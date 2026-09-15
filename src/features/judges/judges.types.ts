@@ -17,10 +17,14 @@
 //
 // Differences from the other features:
 //   - Portraits ARE uploaded through the admin panel via Cloudinary.
-//     The row stores both `imagePublicId` (for delete/replace) and
-//     `imageUrl` (the derived secure URL served to the client).
-//     Upload mechanics live in utils/upload.ts; the service accepts
-//     the already-uploaded result, not raw bytes.
+//     The domain type exposes a single `image: ImageAsset | null`; the
+//     underlying row stores two columns (`image_url`,
+//     `image_public_id`) that are always written together. The
+//     controller receives the uploaded file via multer, uploads it to
+//     Cloudinary via `utils/upload.ts`, and hands the resulting
+//     `ImageAsset | null` to the service as a separate argument.
+//     Upload mechanics live in `utils/upload.ts` — this file only
+//     describes the shapes that cross the service boundary.
 //   - Structured list fields. `education` and `specializations` are
 //     arrays, stored as JSONB. They're rendered as a list and a set
 //     of chips in the detail modal.
@@ -77,12 +81,16 @@ export interface EducationEntry {
 // ─── Cloudinary image reference ──────────────────────────────────────────────
 
 /**
- * A stored image asset. Both fields are persisted together:
+ * A stored image asset. Both fields are always present together:
  *   - `publicId` is required to later delete or replace the asset.
  *   - `url` is the secure (https) delivery URL, cached on the row so
  *     list endpoints don't have to build it on every read.
  *
- * Empty image is represented as `null`, not as an object with empty
+ * The database enforces this pairing with a CHECK constraint. A row
+ * with only one of the two columns set is impossible; if the mapper
+ * ever sees one, it throws rather than degrade to a placeholder.
+ *
+ * "No image" is represented as `null`, not as an object with empty
  * strings — the absence of an image is a state, not a value.
  */
 export interface ImageAsset {
@@ -123,11 +131,12 @@ export interface Judge {
   specializations: string[];
 
   /**
-   * Optional portrait. `null` when no portrait has been uploaded —
-   * the public card falls back to a placeholder.
+   * Optional portrait. `null` when no portrait has been uploaded — the
+   * public card falls back to initials.
    *
-   * Both fields are written together by the service whenever a new
-   * file is uploaded through the admin panel.
+   * Both fields on `ImageAsset` are written together by the service
+   * whenever a new file is uploaded through the admin panel, and both
+   * are cleared together when the portrait is removed.
    */
   image: ImageAsset | null;
 
@@ -159,13 +168,24 @@ export type PublicJudge = Omit<
 // ─── Inputs — what the service accepts ───────────────────────────────────────
 
 /**
- * Editable fields of a judge record. Excludes id, status, timestamps,
- * and audit fields — set by the service, not the client.
+ * Editable fields of a judge record.
  *
- * The image is NOT a URL string here. The client uploads a file; the
- * controller uploads it to Cloudinary and passes the resulting
- * `ImageAsset` (or `null` to clear it). This keeps the service
- * upload-agnostic and testable without Cloudinary.
+ * Excludes id, status, timestamps, and audit fields — those are set by
+ * the service, not the client.
+ *
+ * Excludes the image. Portraits travel as a multipart file, not as JSON,
+ * because the client sends bytes that the server must upload before the
+ * row can be written. The service's `createJudge` / `updateJudge`
+ * functions take the resulting `ImageAsset | null` as a separate
+ * argument:
+ *
+ *   - createJudge(userId, role, input, image: ImageAsset | null)
+ *   - updateJudge(userId, judgeId, input, image: ImageAsset | null | undefined)
+ *
+ * On update, `undefined` means "leave the existing portrait alone",
+ * `null` means "clear it", and an `ImageAsset` means "replace it".
+ * Nothing else in this codebase uses that three-state distinction, so
+ * it's documented at the service boundary rather than here.
  */
 export interface JudgeInput {
   name: string;
@@ -176,7 +196,6 @@ export interface JudgeInput {
   bio: string;
   education: EducationEntry[];
   specializations: string[];
-  image: ImageAsset | null;
 }
 
 // ─── Results — what the controller returns ───────────────────────────────────

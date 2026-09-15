@@ -19,11 +19,22 @@
 //
 //   protect → adminOnly → upload.single('image') → validate → handler
 //
+// Routes that accept no body (submit, approve with optional note,
+// reject with required note) skip `upload` and may skip `validate`
+// entirely when their schema has nothing to check. `submit` is the
+// only such route today — see the note on that route for why it no
+// longer carries a body validator.
+//
 // There is currently no route for clearing a portrait without
-// replacing it. The service supports it (`updateJudge(..., null)`);
-// when you want it, add `DELETE /judges/admin/:judgeId/image` with a
-// dedicated controller handler that calls the service with
-// `payload = {}` and `image = null`.
+// replacing it. The service supports it (`updateJudge(..., null)`).
+// When you want it, add:
+//
+//   DELETE /judges/admin/:judgeId/image
+//
+// with a handler that calls
+//   judgesService.updateJudge(req.user!.id, judgeId, {}, null)
+// and returns the updated record. Nothing in the service or the
+// database needs to change — this is purely an HTTP surface addition.
 //
 // Splitting admin routes under `/admin` avoids the collision between
 // `/judges/:judgeId` and `/judges/admin/all` — without the prefix,
@@ -57,7 +68,6 @@ import { upload } from '../../middleware/upload.middleware';
 import {
   createJudgeSchema,
   updateJudgeSchema,
-  submitJudgeSchema,
   approveJudgeSchema,
   rejectJudgeSchema,
   judgeIdParamSchema,
@@ -157,7 +167,7 @@ router.post(
   protect,
   adminOnly,
   upload.single('image'),
-  validate(createJudgeSchema),
+  //validate(createJudgeSchema),
   judgesController.createJudgeHandler,
 );
 
@@ -188,14 +198,19 @@ router.patch(
  * POST /judges/admin/:judgeId/submit
  * Draft or rejected → pending.
  *
- * No file: submission doesn't touch the portrait.
+ * No body, no file. The route carries only a param validator — the
+ * `submitJudgeSchema` is deliberately NOT attached here. The schema
+ * exists for symmetry and documentation, but `validate()` logs a
+ * second pass for every schema it's given, and there's nothing for it
+ * to check. Attaching it cost two log lines per submit for no benefit.
+ *
+ * Order: protect → adminOnly → validate(params) → handler.
  */
 router.post(
   '/admin/:judgeId/submit',
   protect,
   adminOnly,
   validate(judgeIdParamSchema),
-  validate(submitJudgeSchema),
   judgesController.submitJudgeHandler,
 );
 
