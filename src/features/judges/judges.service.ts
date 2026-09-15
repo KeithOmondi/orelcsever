@@ -3,11 +3,29 @@
 // Service layer for the Judges feature.
 //
 // Responsibilities:
-//   - Public reads: list published judges, read one published judge.
-//   - Admin reads: list all judges (any status), read any by id.
-//   - Admin writes: create draft, update draft, submit for review,
-//     delete a draft.
-//   - Super admin writes: approve (→ published), reject (→ rejected).
+//   - Public reads:   list published judges, read one published judge.
+//   - Admin reads:    list all judges (any status), read any by id,
+//                     list the pending-review queue.
+//   - Admin writes:   create draft, update draft/rejected, submit for
+//                     review, delete draft/rejected.
+//   - Super admin:    everything an admin can do, plus approve,
+//                     reject, and unrestricted edit/delete on any
+//                     record regardless of ownership or status.
+//
+// Authorization model:
+//   Ownership and status gates are enforced here, not in the routes.
+//   The controller passes `req.user.role`; this layer decides whether
+//   the caller may act on the specific record:
+//
+//     Regular admin:
+//       - edit / delete: own draft or rejected records only.
+//       - submit:        own draft or rejected records only.
+//     Super admin:
+//       - edit / delete: any record, any status.
+//       - approve / reject: required role.
+//
+//   Every function that enforces a rule takes `role` as an argument,
+//   so the service stays testable without fabricating an auth context.
 //
 // Nothing here talks HTTP. Controllers call these functions and shape
 // the response. All row → domain mapping lives here.
@@ -176,9 +194,6 @@ const toPublicSummary = (summary: JudgeSummary): PublicJudgeSummary => {
  * Column list used by every read that returns a Summary. Kept as a
  * constant so the SELECT list and the mapper can't drift — if you add
  * a column to `mapJudgeSummary`, add it here too.
- *
- * The string is joined without a trailing newline so the interpolated
- * SQL reads cleanly in logs and EXPLAIN output.
  */
 const SUMMARY_COLUMNS = [
   'id',
@@ -240,10 +255,25 @@ const withTransaction = async <T>(
  * List published judges. Paginated. Optional free-text search across
  * name, station, and title; optional region filter.
  *
- * Ordered by name ASC — alphabetical. A bench listing reads better
- * alphabetically than by any other criterion. If you'd rather rank the
- * Principal Judge first, add a `rank` column and order by it, then by
- * name.
+ * Ordered by judicial seniority, matching the convention used on
+ * judiciary.go.ke:
+ *   1. The Principal Judge first, regardless of appointment year.
+ *   2. Then every other judge by appointment year, earliest first —
+ *      the judge appointed first is the most senior.
+ *   3. Name as a stable tiebreak for judges appointed in the same year.
+ *
+ * `appointed_year` is stored as TEXT, but it's always a four-digit
+ * string. Lexicographic sort on fixed-width digits equals chronological
+ * sort, so no cast is needed.
+ *
+ * The CASE matches any title starting with "Principal" (so a future
+ * "Principal Judge" and today's exact string both work). The ELSE tier
+ * catches "ELC Judge", any other title variant, and the empty string —
+ * drafts with blank titles never reach this query because they aren't
+ * published, but the ELSE keeps the ordering total regardless.
+ *
+ * Ordering happens in SQL, before LIMIT/OFFSET, so pagination stays
+ * consistent: page 2 continues the seniority order begun on page 1.
  */
 export const listPublishedJudges = async (
   options: ListJudgesQuery['query'],
@@ -256,7 +286,7 @@ export const listPublishedJudges = async (
 
   if (search) {
     params.push(`%${search}%`);
-    // Search spans name, station, and title. The mock's search
+    // Search spans name, station, and title. The public search
     // placeholder says "by judge name or station"; title is included
     // because searching "Principal Judge" should surface that record.
     conditions.push(
@@ -279,7 +309,10 @@ export const listPublishedJudges = async (
       `SELECT ${SUMMARY_COLUMNS}
          FROM judges
          ${where}
-         ORDER BY name ASC
+         ORDER BY
+           CASE WHEN title ILIKE 'Principal%' THEN 0 ELSE 1 END,
+           appointed_year ASC,
+           name ASC
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, limit, offset],
     ),
@@ -310,7 +343,7 @@ export const getPublishedJudgeById = async (id: string): Promise<PublicJudge> =>
 
 /**
  * List all judges regardless of status, alphabetical. Used by the
- * admin index page.
+ * admin index page and the super-admin Published tab.
  */
 export const listAllJudges = async (): Promise<JudgeSummary[]> => {
   const result = await query(
@@ -351,6 +384,10 @@ export const getJudgeById = async (id: string): Promise<Judge> => {
 /**
  * Create a new draft judge record. The caller's id and role are stamped
  * on the row for the audit trail.
+ *
+ * Both admins and super admins can create. Every new record lands as a
+ * draft regardless of role — publishing requires the separate submit +
+ * approve cycle.
  *
  * `image` is the result of `uploadBuffer()` in the controller, or `null`
  * if no portrait was uploaded. It is stored as two columns
@@ -393,10 +430,16 @@ export const createJudge = async (
 };
 
 /**
- * Update a judge record the caller owns. Only drafts and rejected
- * records can be edited — once pending, the content is frozen for
- * review; once published, use a super_admin action or unpublish (not
- * implemented).
+ * Update a judge record.
+ *
+ * Authorization:
+ *   - Regular admins may only edit their own records, and only while
+ *     they're still draft or rejected. Once pending, the content is
+ *     frozen for review; once published, regular admins are locked
+ *     out (there is no unpublish action yet).
+ *   - Super admins may edit any record, regardless of who created it
+ *     and regardless of status. Edits to a published record go live
+ *     immediately — no re-review.
  *
  * Partial update: only fields present in `input` are changed.
  *
@@ -421,17 +464,27 @@ export const createJudge = async (
  */
 export const updateJudge = async (
   userId: string,
+  role: Role,
   judgeId: string,
   input: UpdateJudgeInputSchema['payload'],
   image: ImageAsset | null | undefined,
 ): Promise<Judge> => {
   const existing = await getJudgeById(judgeId);
 
-  if (existing.createdBy !== userId) {
+  const isOwner = existing.createdBy === userId;
+  const isSuperAdmin = role === 'super_admin';
+
+  // Ownership gate. Super admins bypass it; regular admins do not.
+  if (!isOwner && !isSuperAdmin) {
     throw new AppError('You can only edit your own judge records.', 403);
   }
 
-  if (existing.status !== 'draft' && existing.status !== 'rejected') {
+  // Status gate. Super admins bypass it; regular admins do not.
+  if (
+    !isSuperAdmin &&
+    existing.status !== 'draft' &&
+    existing.status !== 'rejected'
+  ) {
     throw new AppError(
       'Only drafts and rejected judge records can be edited.',
       409,
@@ -514,7 +567,13 @@ export const updateJudge = async (
 };
 
 /**
- * Submit a draft for review. Moves status draft → pending.
+ * Submit a draft for review. Moves status draft → rejected → pending.
+ *
+ * Ownership and status are checked here; only the record's creator can
+ * submit it, and only from draft or rejected. This is a narrower rule
+ * than update/delete — a super admin cannot submit someone else's
+ * draft, because there's no reason to; they can edit and approve
+ * directly if they need to move it forward.
  */
 export const submitJudge = async (
   userId: string,
@@ -544,9 +603,15 @@ export const submitJudge = async (
 };
 
 /**
- * Delete a judge record. Only the owner can delete it, and only while
- * it's still a draft or rejected. Pending and published records are
- * immutable from the admin's side.
+ * Delete a judge record.
+ *
+ * Authorization:
+ *   - Regular admins may only delete their own records, and only while
+ *     they're still draft or rejected. Pending and published records
+ *     are immutable from the admin's side.
+ *   - Super admins may delete any record, regardless of who created it
+ *     and regardless of status. This is the escape hatch for cleaning
+ *     up published records that shouldn't be live.
  *
  * Cloudinary cleanup is fire-and-forget after the DB delete. If it
  * fails, the row is still gone (correct) and the asset is orphaned
@@ -556,14 +621,25 @@ export const submitJudge = async (
  */
 export const deleteJudge = async (
   userId: string,
+  role: Role,
   judgeId: string,
 ): Promise<void> => {
   const existing = await getJudgeById(judgeId);
 
-  if (existing.createdBy !== userId) {
+  const isOwner = existing.createdBy === userId;
+  const isSuperAdmin = role === 'super_admin';
+
+  // Ownership gate. Super admins bypass it; regular admins do not.
+  if (!isOwner && !isSuperAdmin) {
     throw new AppError('You can only delete your own judge records.', 403);
   }
-  if (existing.status !== 'draft' && existing.status !== 'rejected') {
+
+  // Status gate. Super admins bypass it; regular admins do not.
+  if (
+    !isSuperAdmin &&
+    existing.status !== 'draft' &&
+    existing.status !== 'rejected'
+  ) {
     throw new AppError(
       'Only drafts and rejected judge records can be deleted.',
       409,

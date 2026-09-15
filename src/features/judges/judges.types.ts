@@ -9,11 +9,13 @@
 //     There is no foreign key between them. If you later want admins
 //     to edit their own judge profile, add a nullable `user_id`
 //     column and a link, but keep the two concepts separate.
-//   - The lifecycle mirrors the other features:
+//   - The lifecycle:
 //         draft → pending → published
 //                        ↘ rejected
-//     Admins create and edit drafts; super admins approve or reject.
-//     Only `published` judges are visible on the public site.
+//     Admins create and edit drafts they own; super admins approve,
+//     reject, and additionally have unrestricted edit/delete authority
+//     over any record regardless of who created it or what status it's
+//     in. Only `published` judges are visible on the public site.
 //
 // Differences from the other features:
 //   - Portraits ARE uploaded through the admin panel via Cloudinary.
@@ -28,17 +30,15 @@
 //   - Structured list fields. `education` and `specializations` are
 //     arrays, stored as JSONB. They're rendered as a list and a set
 //     of chips in the detail modal.
-//   - Region is a governed value (used for the filter dropdown in
-//     the mock). Station is free text — station names vary and don't
-//     need to be pinned. Confirm if you'd rather station also be an
-//     enum.
+//   - Region is a governed value. Station is free text — station names
+//     vary and don't need to be pinned.
 
 import { Role } from '../../types/roles';
 
 // ─── Review lifecycle ────────────────────────────────────────────────────────
 
 /**
- * Where a judge record is in the admin → super-admin review pipeline.
+ * Where a judge record is in the review pipeline.
  * Identical to the other features' statuses on purpose.
  */
 export type JudgeStatus = 'draft' | 'pending' | 'published' | 'rejected';
@@ -46,7 +46,7 @@ export type JudgeStatus = 'draft' | 'pending' | 'published' | 'rejected';
 // ─── Region ──────────────────────────────────────────────────────────────────
 
 /**
- * Fixed set of regions. Matches the `<select>` options in the mock's
+ * Fixed set of regions. Matches the `<select>` options in the public
  * filter bar.
  *
  * Stored as TEXT with a CHECK constraint on the database side. Adding
@@ -135,8 +135,8 @@ export interface Judge {
    * public card falls back to initials.
    *
    * Both fields on `ImageAsset` are written together by the service
-   * whenever a new file is uploaded through the admin panel, and both
-   * are cleared together when the portrait is removed.
+   * whenever a new file is uploaded, and both are cleared together
+   * when the portrait is removed.
    */
   image: ImageAsset | null;
 
@@ -176,16 +176,23 @@ export type PublicJudge = Omit<
  * Excludes the image. Portraits travel as a multipart file, not as JSON,
  * because the client sends bytes that the server must upload before the
  * row can be written. The service's `createJudge` / `updateJudge`
- * functions take the resulting `ImageAsset | null` as a separate
- * argument:
+ * functions take the resulting `ImageAsset` as a separate argument:
  *
- *   - createJudge(userId, role, input, image: ImageAsset | null)
- *   - updateJudge(userId, judgeId, input, image: ImageAsset | null | undefined)
+ *   - createJudge(userId, role, input, image)
+ *   - updateJudge(userId, role, judgeId, input, image)
  *
- * On update, `undefined` means "leave the existing portrait alone",
- * `null` means "clear it", and an `ImageAsset` means "replace it".
- * Nothing else in this codebase uses that three-state distinction, so
- * it's documented at the service boundary rather than here.
+ * where `image` is `ImageAsset | null | undefined`:
+ *   - `undefined` → leave the existing portrait alone (update only)
+ *   - `null`      → clear the portrait
+ *   - ImageAsset  → set / replace the portrait
+ *
+ * On create, `undefined` and `null` both mean "no portrait". The
+ * three-state distinction only matters on update.
+ *
+ * The `role` argument is the caller's role. Both service functions use
+ * it to decide whether the ownership and status gates apply — regular
+ * admins are restricted to their own drafts / rejected records; super
+ * admins bypass both gates entirely.
  */
 export interface JudgeInput {
   name: string;

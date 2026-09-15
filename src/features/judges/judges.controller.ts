@@ -11,6 +11,14 @@
 // No business logic. No SQL. No role checks beyond what the middleware
 // already enforced — the service re-verifies authorization anyway.
 //
+// Authorization:
+//   `req.user.role` is passed to every write handler, and the service
+//   decides whether the caller may act on the specific record:
+//     - Regular admins: own drafts / rejected records only.
+//     - Super admins:   any record, any status.
+//   The route middleware (adminOnly / superAdminOnly) is the first
+//   gate; the service is the second and final one.
+//
 // Image handling:
 //   - Routes mount `upload.single('image')` from upload.middleware.ts,
 //     so portraits arrive as `req.file.buffer` on POST/PATCH.
@@ -61,11 +69,11 @@ const param = (req: Request, key: string): string => {
  *
  * A malformed JSON string is a client error (400), not a server error.
  *
- * Note: this returns `unknown`. The caller asserts the shape and the
+ * Note: this returns `unknown`. The caller asserts the shape; the
  * validator has already run on the parsed object (the middleware
  * inspects `req.body.payload` after this same parse, via the schema's
- * `payload` branch). The cast at the callsite is a narrowing hint, not
- * a runtime guarantee — the guarantee comes from the validator.
+ * `payload` branch). The cast at the callsite is a narrowing hint,
+ * not a runtime guarantee — the guarantee comes from the validator.
  */
 const extractPayload = (req: Request): unknown => {
   const raw = req.body?.payload;
@@ -89,8 +97,8 @@ const extractPayload = (req: Request): unknown => {
  * Resolve the `image` argument for the service from the request.
  *
  * The service defines three states on update:
- *   undefined → leave existing portrait alone
- *   null      → clear existing portrait
+ *   undefined  → leave existing portrait alone
+ *   null       → clear existing portrait
  *   ImageAsset → replace existing portrait
  *
  * On create, only two states are meaningful:
@@ -159,7 +167,8 @@ export const getPublishedJudgeHandler = catchAsync(
 
 /**
  * GET /judges/admin/all
- * Admin. Every judge record regardless of status, alphabetical.
+ * Admin or super admin. Every judge record regardless of status,
+ * alphabetical.
  */
 export const listAllJudgesHandler = catchAsync(
   async (_req: Request, res: Response) => {
@@ -170,7 +179,7 @@ export const listAllJudgesHandler = catchAsync(
 
 /**
  * GET /judges/admin/pending
- * Admin. Judge records waiting on review.
+ * Admin or super admin. Judge records waiting on review.
  */
 export const listPendingJudgesHandler = catchAsync(
   async (_req: Request, res: Response) => {
@@ -181,7 +190,8 @@ export const listPendingJudgesHandler = catchAsync(
 
 /**
  * GET /judges/admin/:judgeId
- * Admin. Full judge record, any status, including audit fields.
+ * Admin or super admin. Full judge record, any status, including
+ * audit fields.
  */
 export const getJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {
@@ -195,7 +205,8 @@ export const getJudgeHandler = catchAsync(
 
 /**
  * POST /judges/admin
- * Admin. Creates a new draft judge record.
+ * Admin or super admin. Creates a new draft judge record. The creator's
+ * id and role are stamped on the row for the audit trail.
  *
  * Content types accepted:
  *   - multipart/form-data with a `payload` JSON string field and an
@@ -224,8 +235,12 @@ export const createJudgeHandler = catchAsync(
 
 /**
  * PATCH /judges/admin/:judgeId
- * Admin. Updates a judge record the caller owns. Only drafts and
- * rejected records can be edited.
+ * Admin or super admin. Updates a judge record.
+ *
+ * Authorization is decided by the service, not this handler:
+ *   - Regular admins may only edit their own draft / rejected records.
+ *   - Super admins may edit any record, any status.
+ * Both roles send the same payload shape.
  *
  * Image semantics:
  *   - No file attached        → leave existing portrait alone
@@ -253,6 +268,7 @@ export const updateJudgeHandler = catchAsync(
 
     const judge = await judgesService.updateJudge(
       req.user!.id,
+      req.user!.role,   // ← new: role is passed for the ownership / status gate
       judgeId,
       payload,
       image,
@@ -263,7 +279,12 @@ export const updateJudgeHandler = catchAsync(
 
 /**
  * POST /judges/admin/:judgeId/submit
- * Admin. Moves a draft or rejected judge record to pending.
+ * Admin. Moves a draft or rejected judge record the caller owns to
+ * pending.
+ *
+ * Submission stays owner-only. A super admin who needs to move a stuck
+ * record forward can edit it and approve it directly; submitting
+ * someone else's draft isn't a real workflow.
  */
 export const submitJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {
@@ -275,7 +296,11 @@ export const submitJudgeHandler = catchAsync(
 
 /**
  * DELETE /judges/admin/:judgeId
- * Admin. Deletes the caller's own draft or rejected judge record.
+ * Admin or super admin. Deletes a judge record.
+ *
+ * Authorization is decided by the service:
+ *   - Regular admins may only delete their own draft / rejected records.
+ *   - Super admins may delete any record, any status.
  *
  * The service deletes the Cloudinary portrait after the DB row is
  * removed, fire-and-forget.
@@ -283,7 +308,7 @@ export const submitJudgeHandler = catchAsync(
 export const deleteJudgeHandler = catchAsync(
   async (req: Request, res: Response) => {
     const judgeId = param(req, 'judgeId');
-    await judgesService.deleteJudge(req.user!.id, judgeId);
+    await judgesService.deleteJudge(req.user!.id, req.user!.role, judgeId);
     sendResponse(res, 200, null, 'Judge record deleted.');
   },
 );

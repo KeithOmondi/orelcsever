@@ -29,6 +29,16 @@
 //   - `createJudgeSchema` / `updateJudgeSchema` therefore describe the
 //     shape of `req.body.payload` after parsing, not the raw form.
 //     The middleware unwraps them accordingly.
+//
+// Authorization:
+//   These schemas validate *shape*, not *who*. Any caller who gets
+//   past the route middleware (adminOnly or superAdminOnly) can reach
+//   the handler. The service layer decides whether the caller is
+//   allowed to act on the specific record:
+//     - Regular admins: own drafts / rejected records only.
+//     - Super admins:   any record, any status.
+//   Both roles share the same input schema because both edit the same
+//   fields. There is no "super admin only" field.
 
 import { z } from 'zod';
 import { JUDGE_REGIONS } from './judges.types';
@@ -80,26 +90,36 @@ const appointedYear = () =>
 
 // ─── Education entry ─────────────────────────────────────────────────────────
 //
-// One entry per degree. The mock has entries like
-// "Master of Laws (LL.M) - University of Nairobi". Splitting into
-// degree + institution means the detail modal can render them
-// separately, and a future "find judges who studied at X" feature has
-// something to query.
+// One entry per degree. Splitting degree from institution means the
+// detail modal can render them separately, and a future "find judges
+// who studied at X" feature has something to query.
 //
-// `year` is optional — some entries in the mock omit it. The `.or(z.literal(''))`
-// branch lets an empty string from a form field arrive without failing;
-// it's normalized to `undefined` by the transform.
+// `year` is optional. An empty string from the form field is allowed
+// and normalized to `undefined`. A four-digit value must fall in the
+// same plausible range as `appointedYear` — a graduation year of 1000
+// is a placeholder, not a date. The range check catches form typos
+// before they land in the database.
+
+const educationYearSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{4}$/, { error: 'Year must be a four-digit number.' })
+  .refine(
+    (v) => {
+      const n = Number(v);
+      const now = new Date().getFullYear();
+      return n >= 1950 && n <= now + 1;
+    },
+    { error: 'Year is out of range.' },
+  )
+  .optional()
+  .or(z.literal(''))
+  .transform((v) => (v === '' ? undefined : v));
 
 const educationEntrySchema = z.object({
   degree: trimmedString('Degree', 200),
   institution: trimmedString('Institution', 200),
-  year: z
-    .string()
-    .trim()
-    .regex(/^\d{4}$/, { error: 'Year must be a four-digit number.' })
-    .optional()
-    .or(z.literal(''))
-    .transform((v) => (v === '' ? undefined : v)),
+  year: educationYearSchema,
 });
 
 // ─── Specializations ─────────────────────────────────────────────────────────
@@ -162,7 +182,8 @@ export const judgeInputSchema = z.object({
 // ─── Action inputs ──────────────────────────────────────────────────────────
 
 // POST /judges/admin
-// Admin. Creates a new judge record. Always lands as a draft.
+// Admin or super admin. Creates a new judge record. Always lands as a
+// draft — publishing requires a separate submit + approve cycle.
 //
 // Multipart body. The text half travels as `payload`, a JSON string
 // that the controller JSON.parses before validation. The optional image
@@ -172,8 +193,13 @@ export const createJudgeSchema = z.object({
 });
 
 // PATCH /judges/admin/:judgeId
-// Admin. Updates a judge record the caller owns. Partial — only the
-// fields present are touched.
+// Admin or super admin. Partial — only the fields present are touched.
+//
+// Authorization lives in the service, not here:
+//   - Regular admins may only patch their own draft / rejected records.
+//   - Super admins may patch any record, any status.
+// Both roles send the same payload shape; the service decides whether
+// to apply it.
 //
 // No cross-field refinements here, so plain `.partial()` works. The
 // nested arrays (`education`, `specializations`) become optional too,
@@ -284,8 +310,8 @@ export const listJudgesQuerySchema = z.object({
 // domain types have drifted.
 //
 // Note: `JudgeInputPayload` contains no image. The service's
-// `createJudge` / `updateJudge` take a second argument for the uploaded
-// `ImageAsset | null` — see judges.service.ts.
+// `createJudge` / `updateJudge` take the uploaded `ImageAsset` as a
+// separate argument — see judges.service.ts.
 
 export type JudgeInputPayload       = z.infer<typeof judgeInputSchema>;
 export type CreateJudgeInputSchema  = z.infer<typeof createJudgeSchema>;
